@@ -43,8 +43,10 @@ class RMSNorm(torch.nn.Module):
         Returns:
             torch.Tensor: The normalized tensor.
         """
-        # todo
-        raise NotImplementedError
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True)) + self.eps
+        normalized_x = x * 1 / rms
+        return normalized_x
+
 
     def forward(self, x):
         """
@@ -93,52 +95,56 @@ class Attention(nn.Module):
         Make sure to use attention_dropout (self.attn_dropout) on the computed
         attention matrix before applying it to the value tensor.
         '''
-        # todo
-        raise NotImplementedError
+        scaled_dot_product = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attention_weights = torch.nn.functional.softmax(scaled_dot_product, dim=-1)
+        dropped_attention = self.attn_dropout(attention_weights)
+        output = torch.matmul(dropped_attention, value)
+
+        return output
 
     def forward(
-        self,
-        x: torch.Tensor
-    ):
-        '''
-        Llama2 uses Grouped-Query Attention. The details of GQA are actually
-        not critical to solving this assignment; you are simply asked to
-        compute Scaled Dot Product Attention (see above for details). GQA is
-        a memory optimization to compute multi-head attention efficiently. See
-        Section 2.2 in https://arxiv.org/abs/2305.13245 or
-        https://ai.plainenglish.io/understanding-llama2-kv-cache-grouped-query-attention-rotary-embedding-and-more-c17e5f49a6d7
-        for details.
-        '''
-        batch_size, seqlen, _ = x.shape
+            self,
+            x: torch.Tensor
+        ):
+            '''
+            Llama2 uses Grouped-Query Attention. The details of GQA are actually
+            not critical to solving this assignment; you are simply asked to
+            compute Scaled Dot Product Attention (see above for details). GQA is
+            a memory optimization to compute multi-head attention efficiently. See
+            Section 2.2 in https://arxiv.org/abs/2305.13245 or
+            https://ai.plainenglish.io/understanding-llama2-kv-cache-grouped-query-attention-rotary-embedding-and-more-c17e5f49a6d7
+            for details.
+            '''
+            batch_size, seqlen, _ = x.shape
 
-        query = self.compute_query(x)
-        key = self.compute_key(x)
-        value = self.compute_value(x)
-        query = query.view(batch_size, seqlen, self.n_local_heads, self.head_dim)
-        key = key.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
-        value = value.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
+            query = self.compute_query(x)
+            key = self.compute_key(x)
+            value = self.compute_value(x)
+            query = query.view(batch_size, seqlen, self.n_local_heads, self.head_dim)
+            key = key.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
+            value = value.view(batch_size, seqlen, self.n_local_kv_heads, self.head_dim)
 
-        # RoPE relative positional embeddings
-        query, key = apply_rotary_emb(query, key, self.head_dim, self.max_seq_len)
+            # RoPE relative positional embeddings
+            query, key = apply_rotary_emb(query, key, self.head_dim, self.max_seq_len)
 
-        # Grouped multiquery attention: expand out keys and values.
-        # Convert both to:
-        # (bs, seqlen, n_local_heads, head_dim)
-        key = torch.repeat_interleave(key, dim=2, repeats=self.n_rep)
-        value = torch.repeat_interleave(value, dim=2, repeats=self.n_rep)
+            # Grouped multiquery attention: expand out keys and values.
+            # Convert both to:
+            # (bs, seqlen, n_local_heads, head_dim)
+            key = torch.repeat_interleave(key, dim=2, repeats=self.n_rep)
+            value = torch.repeat_interleave(value, dim=2, repeats=self.n_rep)
 
-        # make heads into a batch dimension
-        query = query.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
-        output = self.compute_query_key_value_scores(query, key, value)
+            # make heads into a batch dimension
+            query = query.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            output = self.compute_query_key_value_scores(query, key, value)
 
-        # restore time as batch dimension and concat heads
-        output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
+            # restore time as batch dimension and concat heads
+            output = output.transpose(1, 2).contiguous().view(batch_size, seqlen, -1)
 
-        # final projection into the residual stream
-        output = self.resid_dropout(self.compute_output(output))
-        return output
+            # final projection into the residual stream
+            output = self.resid_dropout(self.compute_output(output))
+            return output
 
 
 class FeedForward(nn.Module):
@@ -197,7 +203,13 @@ class LlamaLayer(nn.Module):
            output of the feed-forward network
         '''
         # todo
-        raise NotImplementedError
+        attention = self.attention_norm(x)
+        self_attention = self.attention(attention)
+        res_attention = x + self_attention
+        norm_attention = self.ffn_norm(res_attention)
+        ffn = self.feed_forward(norm_attention)
+
+        return res_attention + ffn
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -274,11 +286,10 @@ class Llama(LlamaPreTrainedModel):
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] # crop to just the final time step
             # todo
-            raise NotImplementedError
 
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 '''
                 Perform temperature sampling:
@@ -289,7 +300,9 @@ class Llama(LlamaPreTrainedModel):
 
                 Note that we are not using top-k sampling/nucleus sampling in this procedure.
                 '''
-                idx_next = None
+                scaled_logits = logits / temperature
+                scaled_probs = F.softmax(scaled_logits, dim=-1)
+                idx_next = torch.multinomial(scaled_probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
